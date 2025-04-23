@@ -24,6 +24,9 @@ parser.add_argument('--dff', default=512, type=int)
 parser.add_argument('--if-attack', action='store_true', help='Enable attack during evaluation')
 parser.add_argument('--attack-epsilon', type=float, default=0.1, help='Attack strength')
 parser.add_argument('--results-file', default='results.json', type=str)
+parser.add_argument('--fim-type', default='standard', type=str, choices=['standard', 'hilo'],
+                    help='Type of Feature Importance Module to use (standard or hilo)')
+parser.add_argument('--max-seq-len', default=32, type=int, help='Maximum sequence length to match training')
 
 def evaluate(args, model, metrics, dataloader, snr_range):
     """Evaluate model across different SNR values"""
@@ -33,7 +36,7 @@ def evaluate(args, model, metrics, dataloader, snr_range):
     # Initialize attack if needed
     attack = None
     if args.if_attack:
-        attack = TextFGSM(model, epsilon=args.attack_epsilon)
+        attack = TextFGSM(model, epsilon=args.attack_epsilon, return_embeddings=False)
     
     with torch.no_grad():
         for snr in snr_range:
@@ -43,8 +46,27 @@ def evaluate(args, model, metrics, dataloader, snr_range):
             # Track metrics for this SNR
             batch_metrics = []
             
-            for batch in tqdm(dataloader):
-                batch_result = metrics.evaluate_batch(model, batch, attack, noise_var)
+            for sents, original_idx in tqdm(dataloader):
+                # Move batch to device and handle masks
+                sents = sents.to(device)
+                src_mask = (sents == token_to_idx["<PAD>"]).unsqueeze(-2)
+                
+                if attack is not None:
+                    # For evaluation under attack, create simple perturbations without requiring gradients
+                    batch_result = metrics.evaluate_batch_with_attack(
+                        model=model, 
+                        clean_input=sents, 
+                        noise_var=noise_var,
+                        attack_epsilon=args.attack_epsilon
+                    )
+                else:
+                    batch_result = metrics.evaluate_batch(
+                        model=model, 
+                        clean_input=sents, 
+                        attacked_input=None, 
+                        noise_var=noise_var
+                    )
+                
                 batch_metrics.append(batch_result)
             
             # Average metrics across batches
@@ -86,16 +108,31 @@ def evaluate(args, model, metrics, dataloader, snr_range):
 if __name__ == '__main__':
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.vocab_file = '/content/drive/MyDrive/DeepSC-FIM/data/txt/' + args.vocab_file
+    
+    # Fix the vocabulary file path to match the training path structure
+    args.vocab_file = '/content/data/txt/' + args.vocab_file
+    
     # Load vocabulary
     vocab = json.load(open(args.vocab_file, 'rb'))
     token_to_idx = vocab['token_to_idx']
     num_vocab = len(token_to_idx)
     
-    # Initialize model
-    model = DeepSC(args.num_layers, num_vocab, num_vocab,
-                   num_vocab, num_vocab, args.d_model, args.num_heads,
-                   args.dff, 0.1).to(device)
+    # Use fixed max_seq_len to match the training model
+    max_seq_len = args.max_seq_len
+    
+    # Initialize model with same parameters as training
+    model = DeepSC(
+        num_layers=args.num_layers,
+        src_vocab_size=num_vocab,
+        trg_vocab_size=num_vocab,
+        src_max_len=max_seq_len,
+        trg_max_len=max_seq_len,
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        dff=args.dff,
+        dropout=0.1,
+        fim_type=args.fim_type
+    ).to(device)
     
     # Load checkpoint
     checkpoint = torch.load(args.checkpoint_path)
@@ -120,4 +157,4 @@ if __name__ == '__main__':
     # Save results
     with open(args.results_file, 'w') as f:
         json.dump(results, f, indent=4)
-    print(f"\nResults saved to {args.results_file}") 
+    print(f"\nResults saved to {args.results_file}")

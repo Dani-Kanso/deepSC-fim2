@@ -58,10 +58,11 @@ def validate(epoch, args, net):
     noise_std = SNR_to_noise(args.test_snr)
     
     with torch.no_grad():
-        for sents in tqdm(test_iterator, desc="Validation"):
-            sents = sents.to(device)
+        for sents, original_idx in tqdm(test_iterator, desc="Validation"):
+            # Ensure tensors are LongTensor
+            sents = sents.long().to(device)
             
-            # Create source and target masks if needed
+            # Create source and target masks
             src_mask = (sents == pad_idx).unsqueeze(1).to(device)  # [B, 1, L]
             
             # Forward pass with FIM
@@ -80,10 +81,15 @@ def validate(epoch, args, net):
                 sents.view(-1)
             )
             
-            # Sum losses, handling the case where fim_loss might be None
+            # Sum losses
             batch_loss = task_loss.item()
             if fim_loss is not None:
-                batch_loss += args.gamma * fim_loss.item()
+                # Make sure fim_loss is a scalar
+                if isinstance(fim_loss, torch.Tensor) and fim_loss.numel() > 1:
+                    fim_loss = fim_loss.mean()
+                
+                # Add to batch loss, checking if it's a tensor or float
+                batch_loss += args.gamma * (fim_loss.item() if isinstance(fim_loss, torch.Tensor) else fim_loss)
                 
             total_loss += batch_loss * sents.size(0)
             total_samples += sents.size(0)
@@ -103,8 +109,9 @@ def train(epoch, args, net, optimizer, mi_net=None, attack=None):
     total_loss = 0
     total_samples = 0
     
-    for batch_idx, sents in enumerate(tqdm(train_iterator, desc="Training")):
-        sents = sents.to(device)
+    for batch_idx, (sents, original_idx) in enumerate(tqdm(train_iterator, desc="Training")):
+        # Ensure tensors are LongTensor
+        sents = sents.long().to(device)
         optimizer.zero_grad()
         
         # Create source and target masks if needed
@@ -115,8 +122,11 @@ def train(epoch, args, net, optimizer, mi_net=None, attack=None):
             with torch.enable_grad():
                 src_adv = attack.perturb(
                     sents, sents, noise_std, 
-                    src_mask=src_mask, trg_mask=src_mask
+                    src_mask=src_mask, trg_mask=src_mask,
+                    original_idx=original_idx  # Pass original indices to attack
                 )
+                # Ensure adversarial examples are also LongTensor
+                src_adv = src_adv.long() if src_adv.dtype != torch.long else src_adv
         else:
             src_adv = sents
         
@@ -139,6 +149,9 @@ def train(epoch, args, net, optimizer, mi_net=None, attack=None):
         # Total loss = task loss + gamma * FIM loss
         total_loss_value = task_loss
         if fim_loss is not None:
+            # Make sure fim_loss is a scalar
+            if isinstance(fim_loss, torch.Tensor) and fim_loss.numel() > 1:
+                fim_loss = fim_loss.mean()
             total_loss_value = task_loss + args.gamma * fim_loss
         
         # Backward pass
@@ -148,7 +161,12 @@ def train(epoch, args, net, optimizer, mi_net=None, attack=None):
         # Log batch loss
         batch_loss = task_loss.item()
         if fim_loss is not None:
-            batch_loss += args.gamma * (fim_loss.item() if isinstance(fim_loss, torch.Tensor) else fim_loss)
+            # Make sure fim_loss is a scalar for logging
+            if isinstance(fim_loss, torch.Tensor) and fim_loss.numel() > 1:
+                fim_loss_scalar = fim_loss.mean()
+            else:
+                fim_loss_scalar = fim_loss
+            batch_loss += args.gamma * (fim_loss_scalar.item() if isinstance(fim_loss_scalar, torch.Tensor) else fim_loss_scalar)
         
         total_loss += batch_loss * sents.size(0)
         total_samples += sents.size(0)
@@ -170,18 +188,22 @@ if __name__ == '__main__':
     print(f"Testing with SNR: {args.test_snr}")
     
     # Load vocabulary
+    args.vocab_file = '/content/data/txt/' + args.vocab_file
     vocab = json.load(open(args.vocab_file, 'rb'))
     token_to_idx = vocab['token_to_idx']
     num_vocab = len(token_to_idx)
     pad_idx = token_to_idx["<PAD>"]
+    
+    # Set consistent max sequence length
+    max_seq_len = 32  # Use fixed length to avoid dimension mismatches
     
     # Initialize models
     deepsc = DeepSC(
         num_layers=args.num_layers,
         src_vocab_size=num_vocab,
         trg_vocab_size=num_vocab,
-        src_max_len=args.MAX_LENGTH,
-        trg_max_len=args.MAX_LENGTH,
+        src_max_len=max_seq_len,  # Use consistent max length
+        trg_max_len=max_seq_len,  # Use consistent max length
         d_model=args.d_model,
         num_heads=args.num_heads,
         dff=args.dff,
@@ -199,7 +221,7 @@ if __name__ == '__main__':
     attack = None
     if args.if_attack_train:
         print("Initializing adversarial attack for training")
-        attack = TextFGSM(deepsc, epsilon=0.1, alpha=0.01)
+        attack = TextFGSM(deepsc, epsilon=0.1, alpha=0.01, return_embeddings=False)
     
     # Create checkpoint directory
     if not os.path.exists(args.checkpoint_path):

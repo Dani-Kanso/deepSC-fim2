@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 class EurDataset(Dataset):
     def __init__(self, split='train'):
-        data_dir = '/content/drive/MyDrive/DeepSC-FIM/data/txt/'
+        data_dir = '/content/data/txt/'
         with open(data_dir + 'europarl/{}_data.pkl'.format(split), 'rb') as f:
             self.data = pickle.load(f)
 
@@ -27,14 +27,18 @@ class EurDataset(Dataset):
         return len(self.data)
 
 def collate_data(batch):
-
     batch_size = len(batch)
-    max_len = max(map(lambda x: len(x), batch))   # get the max length of sentence in current batch
+    # Sort sequences by length in descending order and keep track of original indices
+    sort_by_len_with_idx = sorted(enumerate(batch), key=lambda x: len(x[1]), reverse=True)
+    original_idx, sort_by_len = zip(*sort_by_len_with_idx)
+    
+    max_len = min(32, len(sort_by_len[0]))  # Cap maximum length at 32
     sents = np.zeros((batch_size, max_len), dtype=np.int64)
-    sort_by_len = sorted(batch, key=lambda x: len(x), reverse=True)
 
     for i, sent in enumerate(sort_by_len):
-        length = len(sent)
-        sents[i, :length] = sent  # padding the questions
+        length = min(len(sent), max_len)  # Truncate if longer than max_len
+        sents[i, :length] = sent[:length]  # Padding and truncation
 
-    return  torch.from_numpy(sents)
+    # Convert to tensor and store original indices for restoration
+    sents = torch.from_numpy(sents)
+    return sents, torch.tensor(original_idx)

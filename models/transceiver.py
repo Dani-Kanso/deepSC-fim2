@@ -27,25 +27,38 @@ from utils import PowerNormalize, Channels
 
 
 class PositionalEncoding(nn.Module):
-    "Implement the PE function."
+    "Implement the PE function with dynamic sequence length handling."
     def __init__(self, d_model, dropout, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
+        self.d_model = d_model
+        self.max_len = max_len
         
-        # Compute the positional encodings once in log space.
+        # Pre-compute position embeddings for the maximum length
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1) # [max_len, 1]
-        div_term = torch.exp(torch.arange(0, d_model, 2) *
-                             -(math.log(10000.0) / d_model)) #math.log(math.exp(1)) = 1
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0) #[1, max_len, d_model]
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         self.register_buffer('pe', pe)
         
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
-        x = self.dropout(x)
-        return x
+        seq_len = x.size(1)
+        if seq_len > self.pe.size(1):
+            # If sequence is longer than buffer, create new positional encodings
+            pe = torch.zeros(1, seq_len, self.d_model, device=x.device)
+            position = torch.arange(0, seq_len, device=x.device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, self.d_model, 2, device=x.device) * 
+                               -(math.log(10000.0) / self.d_model))
+            pe[0, :, 0::2] = torch.sin(position * div_term)
+            pe[0, :, 1::2] = torch.cos(position * div_term)
+        else:
+            # Use pre-computed encodings
+            pe = self.pe[:, :seq_len]
+        
+        x = x + pe
+        return self.dropout(x)
   
 class MultiHeadedAttention(nn.Module):
     def __init__(self, num_heads, d_model, dropout=0.1):
@@ -316,17 +329,34 @@ class DeepSC(nn.Module):
         # Final output layer
         self.fc_out = nn.Linear(d_model, trg_vocab_size)
 
+    def calculate_snr(self, n_var):
+        """Calculate SNR from noise variance"""
+        if isinstance(n_var, float) or isinstance(n_var, int):
+            # Convert noise variance to dB SNR
+            # SNR = 10 * log10(1/n_var) for normalized signal power of 1
+            return 10 * math.log10(1/n_var)
+        else:
+            # Handle tensor case
+            return 10 * torch.log10(1/n_var)
+
     def forward(self, src, trg_inp, n_var, src_mask=None, trg_mask=None, target=None):
         fim_loss_total = 0.0
         snr = self.calculate_snr(n_var)
         
         # Encoder with per-layer FIM
-        enc_output = self.encoder_embedding(src) * math.sqrt(self.d_model)
-        enc_output = self.encoder_pe(enc_output)
+        # Check if src is already an embedding tensor (output from TextFGSM.perturb)
+        if src.dim() == 3 and src.size(2) == self.d_model:
+            # src is already an embedding tensor
+            enc_output = src
+        else:
+            # src is a token index tensor, needs embedding
+            src = src.long() if src.dtype != torch.long else src
+            enc_output = self.encoder_embedding(src) * math.sqrt(self.d_model)
+            enc_output = self.encoder_pe(enc_output)
         
         for enc_layer, fim in zip(self.encoder_layers, self.fim_encoders):
             enc_output = enc_layer(enc_output, src_mask)
-            enc_output, fim_loss = fim(enc_output, snr, target)
+            enc_output, fim_loss = fim(enc_output, snr, mask=src_mask, target=target)
             fim_loss_total += fim_loss if fim_loss is not None else 0.0
         
         # Channel processing (keep your existing implementation)
@@ -344,35 +374,90 @@ class DeepSC(nn.Module):
                 dec_output, channel_dec_output,
                 trg_mask, src_mask
             )
-            dec_output, fim_loss = fim(dec_output, snr, target)
+            dec_output, fim_loss = fim(dec_output, snr, mask=trg_mask, target=target)
             fim_loss_total += fim_loss if fim_loss is not None else 0.0
         
         # Final output
         output = self.fc_out(dec_output)
         
+        # Ensure fim_loss_total is a scalar
+        if isinstance(fim_loss_total, torch.Tensor) and fim_loss_total.numel() > 1:
+            fim_loss_total = fim_loss_total.mean()
+        
         return output, fim_loss_total
 
-    def calculate_snr(self, n_var):
-        signal_power = 1.0  # Assuming normalized input
-        snr_lin = signal_power / n_var
-        return 10 * torch.log10(snr_lin).unsqueeze(-1)
-
-    
+    def forward_from_embeddings(self, embeddings, trg_inp, n_var, src_mask=None, trg_mask=None, target=None):
+        """Forward pass starting from embeddings instead of raw tokens"""
+        fim_loss_total = 0.0
+        snr = self.calculate_snr(n_var)
         
+        # Start from provided embeddings
+        enc_output = embeddings
         
+        # Apply FIM layers
+        for fim in self.fim_encoders:
+            enc_output, fim_loss = fim(
+                enc_output,
+                snr,
+                mask=src_mask,  # Pass src_mask to FIM
+                target=target
+            )
+            fim_loss_total += fim_loss if fim_loss is not None else 0.0
         
+        # Channel encoding and transmission
+        channel_enc_output = self.channel_encoder(enc_output)
+        Tx_sig = PowerNormalize(channel_enc_output)
         
+        # Channel transmission
+        Rx_sig = Channels().AWGN(Tx_sig, n_var)
         
+        # Channel decoding
+        channel_dec_output = self.channel_decoder(Rx_sig)
+        
+        # Decoder processing with proper masking
+        # Ensure trg_inp is LongTensor
+        trg_inp = trg_inp.long() if trg_inp.dtype != torch.long else trg_inp
+        dec_output = self.decoder_embedding(trg_inp) * math.sqrt(self.d_model)
+        dec_output = self.decoder_pe(dec_output)
+        
+        for dec_layer, fim in zip(self.decoder_layers, self.fim_decoders):
+            dec_output = dec_layer(
+                dec_output, channel_dec_output,
+                trg_mask, src_mask
+            )
+            dec_output, fim_loss = fim(
+                dec_output,
+                snr,
+                mask=trg_mask,
+                target=target
+            )
+            fim_loss_total += fim_loss if fim_loss is not None else 0.0
+        
+        # Final output
+        output = self.fc_out(dec_output)
+        
+        # Ensure fim_loss_total is a scalar
+        if isinstance(fim_loss_total, torch.Tensor) and fim_loss_total.numel() > 1:
+            fim_loss_total = fim_loss_total.mean()
+        
+        return output, fim_loss_total
 
-    
-
-    
-    
-    
-    
-    
 
 
-    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 

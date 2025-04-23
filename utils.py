@@ -242,7 +242,7 @@ def train_step(model, src, trg, n_var, pad, opt, criterion, channel, mi_net=None
     # Apply attack if enabled
     if if_attack:
         from models.attack import TextFGSM
-        attack = TextFGSM(model, epsilon=0.1, alpha=0.01, max_iters=3)
+        attack = TextFGSM(model, epsilon=0.1, alpha=0.01, max_iters=3, return_embeddings=False)
         enc_output = attack.perturb(enc_output, trg_real, src_mask)
     
     # Apply FIM
@@ -333,7 +333,7 @@ def val_step(model, src, trg, n_var, pad, criterion, channel, if_attack=False):
     # Apply attack if enabled
     if if_attack:
         from models.attack import TextFGSM
-        attack = TextFGSM(model, epsilon=0.1, alpha=0.01, max_iters=3)
+        attack = TextFGSM(model, epsilon=0.1, alpha=0.01, max_iters=3, return_embeddings=False)
         enc_output = attack.perturb(enc_output, trg_real, src_mask)
     
     # Apply FIM
